@@ -4,7 +4,11 @@ Machine routes stay the ones stored in a Taillard-style instance. Only operation
 processing times change. A fixed disjunctive graph (the machine order already
 chosen) is scored by the existing message-passing calculator
 ``MassagePassingEval`` — the class name is the original spelling and is not
-renamed here. This module does not change N5, the policy, or training.
+renamed here.
+
+N5 and the policy's critical-path features stay on one nominal CPM pass.
+``StochasticRewardConfig`` can opt the training reward into the mean or CVaR
+of scenario makespans. ``n_scenarios=0`` (the default) samples nothing.
 """
 
 import argparse
@@ -273,13 +277,13 @@ def generate_stochastic_scenarios(instance, n_scenarios, cv, distribution="logno
     )
 
 
-def _tail_start(alpha, n):
-    """0-based index of the first ascending order statistic included in CVaR.
+def _tail_mass(alpha, n):
+    """Tail length ``w = (1 - alpha) * n`` in units of scenarios.
 
-    ``CVaR_alpha`` averages ``C_(i*), ..., C_(n)`` with ``i* = ceil(alpha * n)``
-    (1-based). ``alpha == 0`` uses every scenario. ``alpha == 1`` uses the worst.
-    ``alpha * n`` is snapped to an integer when it is within ``1e-8``, so binary
-    rounding of common levels (0.9, 0.95, ...) does not move the cut.
+    ``w`` is snapped to the nearest integer when it is within ``1e-8``, so
+    binary rounding of a common level (``(1 - 0.9) * 10`` is
+    ``0.9999999999999998`` in float64) does not move an integer cut.
+    ``alpha = 0`` returns ``n``. ``alpha = 1`` returns ``0``.
     """
     alpha = float(alpha)
     if not math.isfinite(alpha) or alpha < 0.0 or alpha > 1.0:
@@ -287,43 +291,237 @@ def _tail_start(alpha, n):
     if n < 1:
         raise ValueError("CVaR needs at least one scenario")
     if alpha <= 0.0:
-        return 0
+        return float(n)
     if alpha >= 1.0:
-        return n - 1
-    scaled = alpha * n
-    nearest = round(scaled)
-    if abs(scaled - nearest) <= 1e-8:
-        scaled = float(nearest)
-    start = int(math.ceil(scaled)) - 1
-    if start < 0:
-        return 0
-    if start > n - 1:
-        return n - 1
-    return start
+        return 0.0
+    w = (1.0 - alpha) * float(n)
+    nearest = round(w)
+    if abs(w - nearest) <= 1e-8:
+        w = float(nearest)
+    if w < 0.0:
+        return 0.0
+    if w > float(n):
+        return float(n)
+    return float(w)
 
 
 def empirical_cvar(samples, alpha):
-    """Upper-tail empirical CVaR of makespan at level ``alpha``.
+    """Upper-tail empirical CVaR (Expected Shortfall) of makespan.
 
-    ``samples`` is ``(n_scenarios,)`` or ``(..., n_scenarios)``. Scenarios are
-    sorted ascending on the last axis and averaged from index
-    ``ceil(alpha * n) - 1`` through the worst makespan. This is at least the
-    mean of the same samples. ``alpha=0.9`` is the usual risk level.
+    ``samples`` is ``(n_scenarios,)`` or ``(..., n_scenarios)``. Larger is
+    worse. ``alpha`` is in ``[0, 1]``. Let ``C_(1) <= ... <= C_(n)`` be the
+    ascending order statistics and ``w = (1 - alpha) * n`` (see
+    :func:`_tail_mass` for the integer snap).
+
+    For ``alpha < 1`` this is the Rockafellar-Uryasev discrete CVaR
+
+        min over zeta of
+            zeta + (1 / (n * (1 - alpha))) * sum_i max(C_i - zeta, 0)
+
+    which is also the integral of the empirical quantile function
+    ``q(u) = C_(ceil(n * u))``:
+
+        CVaR_alpha = (1 / (1 - alpha)) * integral_alpha^1 q(u) du.
+
+    ``alpha = 1`` is the worst scenario ``C_(n)``. The minimization is not
+    used there, because the tail probability is 0.
+
+    Closed form, with ``k = floor(w)`` and ``r = w - k``:
+
+    * If ``w`` is an integer, including ``alpha = 0`` where ``w = n``, CVaR is
+      exactly the mean of the worst ``w`` scenarios
+      ``C_(n - w + 1), ..., C_(n)``.
+    * Otherwise CVaR is ``(sum of the k worst + r * C_(n - k)) / w``.
+      Each of those ``k`` scenarios has weight ``1 / w`` and the next order
+      statistic has weight ``r / w``. The weights sum to 1, so the probability
+      mass is exactly ``w / n = 1 - alpha``.
+    * If ``k = 0`` (the tail is thinner than one scenario), CVaR is ``C_(n)``.
+
+    ``alpha = 0.9`` and ``n = 10`` give ``w = 1``, the single worst scenario
+    (the worst 10 percent). On the same samples, ``mean <= CVaR_alpha``.
     """
     values = np.asarray(samples, dtype=np.float64)
     if values.ndim == 0:
         values = values.reshape(1)
     n = int(values.shape[-1])
-    start = _tail_start(alpha, n)
+    w = _tail_mass(alpha, n)
     ordered = np.sort(values, axis=-1)
-    return ordered[..., start:].mean(axis=-1)
+    if w <= 0.0:
+        return ordered[..., -1]
+    if w >= n:
+        return ordered.mean(axis=-1)
+    k = int(math.floor(w))
+    r = w - float(k)
+    if k <= 0:
+        return ordered[..., -1]
+    tail = ordered[..., n - k:]
+    if r == 0.0:
+        return tail.mean(axis=-1)
+    boundary = ordered[..., n - k - 1]
+    return (tail.sum(axis=-1) + r * boundary) / w
+
+
+def scenario_objective(result, cvar_weight=0.0):
+    """Convex combination ``(1 - w) * mean + w * CVaR`` of a scenario score.
+
+    ``w = 0`` is the expected makespan. ``w = 1`` is CVaR. ``result`` is a
+    :class:`ScenarioEvalResult` or a ``(mean, cvar)`` pair. Lower is better.
+    """
+    w = float(cvar_weight)
+    if not math.isfinite(w) or w < 0.0 or w > 1.0:
+        raise ValueError("cvar_weight must be in [0, 1]; got {w}".format(w=cvar_weight))
+    if isinstance(result, ScenarioEvalResult):
+        mean, cvar = result.mean, result.cvar
+    else:
+        mean, cvar = result
+    mean = np.asarray(mean, dtype=np.float64)
+    cvar = np.asarray(cvar, dtype=np.float64)
+    return (1.0 - w) * mean + w * cvar
+
+
+def resolve_cvar_weight(reward_objective="mean", cvar_weight=None):
+    """Map the reward flag onto the convex-combination weight.
+
+    ``mean`` -> 0, ``cvar`` -> 1. ``mix`` uses ``cvar_weight`` in ``[0, 1]``.
+    Passing a non-default weight together with ``mean`` or ``cvar`` is an
+    error so the flag and the weight cannot silently disagree.
+    """
+    name = str(reward_objective).lower().strip()
+    if name not in ("mean", "cvar", "mix"):
+        raise ValueError(
+            "reward_objective must be 'mean', 'cvar', or 'mix'; got {name!r}".format(name=reward_objective)
+        )
+    if name == "mean":
+        if cvar_weight not in (None, 0, 0.0):
+            raise ValueError(
+                "reward_objective='mean' trains on expected makespan. "
+                "Use reward_objective='mix' with cvar_weight in [0, 1] for a convex combination."
+            )
+        return 0.0
+    if name == "cvar":
+        if cvar_weight not in (None, 1, 1.0):
+            raise ValueError(
+                "reward_objective='cvar' trains on CVaR. "
+                "Use reward_objective='mix' with cvar_weight in [0, 1] for a convex combination."
+            )
+        return 1.0
+    if cvar_weight is None:
+        raise ValueError("reward_objective='mix' requires cvar_weight in [0, 1]")
+    w = float(cvar_weight)
+    if not math.isfinite(w) or w < 0.0 or w > 1.0:
+        raise ValueError("cvar_weight must be in [0, 1]; got {w}".format(w=cvar_weight))
+    return w
+
+
+class StochasticRewardConfig:
+    """Optional scenario objective for the training reward.
+
+    ``n_scenarios=0`` (the default) leaves the reward on the nominal makespan
+    and does not draw scenarios. Otherwise one batch of processing times is
+    drawn in ``Env.reset`` and every later machine order is rescored on that
+    same batch. The scalar is
+
+        (1 - cvar_weight) * mean(makespan) + cvar_weight * CVaR_alpha(makespan).
+
+    ``cvar_weight=0`` trains on the mean. ``cvar_weight=1`` trains on CVaR.
+    N5 and the actor's critical-path features are not read from this config.
+    """
+
+    def __init__(self, n_scenarios=0, cv=0.0, distribution="lognormal", alpha=0.9, cvar_weight=0.0, seed=0):
+        self.n_scenarios = int(n_scenarios)
+        if self.n_scenarios < 0:
+            raise ValueError("n_scenarios must be >= 0 (0 disables scenario scoring)")
+        self.cv = float(cv)
+        self.distribution = str(distribution).lower().strip()
+        self.alpha = float(alpha)
+        if not math.isfinite(self.alpha) or self.alpha < 0.0 or self.alpha > 1.0:
+            raise ValueError("alpha must be in [0, 1]")
+        self.cvar_weight = float(cvar_weight)
+        if not math.isfinite(self.cvar_weight) or self.cvar_weight < 0.0 or self.cvar_weight > 1.0:
+            raise ValueError("cvar_weight must be in [0, 1]")
+        self.seed = int(seed)
+        if self.n_scenarios > 0:
+            self.distribution = _normalize_distribution(self.distribution)
+            if not math.isfinite(self.cv) or self.cv < 0.0:
+                raise ValueError("cv must be a finite number >= 0")
+        if self.cvar_weight <= 0.0:
+            self.reward_objective = "mean"
+        elif self.cvar_weight >= 1.0:
+            self.reward_objective = "cvar"
+        else:
+            self.reward_objective = "mix"
+
+    @property
+    def enabled(self):
+        return self.n_scenarios > 0
+
+    @classmethod
+    def from_flags(
+        cls,
+        n_scenarios=0,
+        cv=0.0,
+        distribution="lognormal",
+        alpha=0.9,
+        reward_objective="mean",
+        cvar_weight=None,
+        seed=0,
+    ):
+        """Build a config from the training CLI flags."""
+        weight = resolve_cvar_weight(reward_objective, cvar_weight)
+        return cls(
+            n_scenarios=n_scenarios,
+            cv=cv,
+            distribution=distribution,
+            alpha=alpha,
+            cvar_weight=weight,
+            seed=seed,
+        )
+
+    def __repr__(self):
+        return (
+            "StochasticRewardConfig(n_scenarios={n}, cv={cv}, distribution={dist!r}, "
+            "alpha={alpha}, cvar_weight={w}, seed={seed}, enabled={enabled})"
+            .format(
+                n=self.n_scenarios,
+                cv=self.cv,
+                dist=self.distribution,
+                alpha=self.alpha,
+                w=self.cvar_weight,
+                seed=self.seed,
+                enabled=self.enabled,
+            )
+        )
 
 
 def _graph_list(graph):
-    if isinstance(graph, Batch):
-        return graph.to_data_list()
+    """One ``Data`` per disjunctive graph.
+
+    A ``Batch`` is split by node pointer. ``Batch.to_data_list`` reuses the
+    ``edge_index`` slices saved when the batch was built. ``Env.step`` replaces
+    ``edge_index`` with a new concatenation those slices do not describe, so
+    edges are grouped by their endpoints instead. Makespan does not depend on
+    edge order.
+    """
     if isinstance(graph, (list, tuple)):
         return list(graph)
+    if isinstance(graph, Batch) and getattr(graph, "ptr", None) is not None and graph.ptr.numel() > 1:
+        edge_index = graph.edge_index
+        graphs = []
+        ptr = graph.ptr
+        for i in range(int(ptr.numel()) - 1):
+            left = int(ptr[i].item())
+            right = int(ptr[i + 1].item())
+            src = edge_index[0]
+            dst = edge_index[1]
+            mask = (src >= left) & (src < right) & (dst >= left) & (dst < right)
+            graphs.append(
+                Data(
+                    dur=graph.dur[left:right].detach().clone(),
+                    edge_index=(edge_index[:, mask] - left).detach().clone(),
+                    num_nodes=right - left,
+                )
+            )
+        return graphs
     return [graph]
 
 
@@ -408,7 +606,8 @@ def evaluate_scenarios(graph, scenario_times, alpha=0.9, device=None, evaluator=
     forward/backward message passing is not reimplemented.
 
     Returns a :class:`ScenarioEvalResult` with per-scenario makespan, the mean,
-    and upper-tail CVaR at ``alpha`` (default 0.9). The input graph is not modified.
+    and upper-tail CVaR at ``alpha`` (default 0.9). CVaR is the discrete
+    Expected Shortfall in :func:`empirical_cvar`. The input graph is not modified.
     """
     graphs = _graph_list(graph)
     if len(graphs) == 0:

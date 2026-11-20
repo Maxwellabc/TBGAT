@@ -38,6 +38,40 @@ parser.add_argument('--problem_type', type=str, default='JSSP', choices=('FSSP',
 # ts_inner: if exists non-tabu, DRL select from non-tabu, elif exists mvs meet aspiration criteria, DRL select from
 # aspiration, else random select.
 parser.add_argument('--action_selection_type', type=str, default='ls', choices=('ls', 'ts_outer', 'ts_inner'))
+## stochastic training reward. n_scenarios=0 (default) does not sample scenarios
+## and leaves the nominal makespan reward, N5, and actor features unchanged.
+## Keep the distribution names in sync with env.stochastic_jsp.DISTRIBUTIONS.
+parser.add_argument(
+    '--n_scenarios', type=int, default=0,
+    help='Processing-time scenarios for the training reward. '
+         '0 (default) keeps the deterministic makespan reward and does not sample scenarios.',
+)
+parser.add_argument(
+    '--cv', type=float, default=0.0,
+    help='Coefficient of variation of processing times when --n_scenarios > 0. '
+         '0 reproduces the nominal times.',
+)
+parser.add_argument(
+    '--distribution', type=str, default='lognormal', choices=('lognormal', 'uniform', 'nominal'),
+    help='Processing-time distribution when --n_scenarios > 0. '
+         'nominal ignores --cv. Draws use --training_seed and a private NumPy Generator.',
+)
+parser.add_argument(
+    '--alpha', type=float, default=0.9,
+    help='Upper-tail CVaR level of makespan when --n_scenarios > 0.',
+)
+parser.add_argument(
+    '--reward_objective', type=str, default='mean', choices=('mean', 'cvar', 'mix'),
+    help='Training objective when --n_scenarios > 0. '
+         'mean (default) is expected makespan. '
+         'cvar is empirical CVaR at --alpha. '
+         'mix is (1-w)*mean + w*CVaR and requires --cvar_weight. '
+         'Do not pass --cvar_weight together with mean or cvar.',
+)
+parser.add_argument(
+    '--cvar_weight', type=float, default=None,
+    help='Weight w in (1-w)*mean + w*CVaR. Required when --reward_objective mix.',
+)
 ## testing parameters
 parser.add_argument('--test_specific_size', type=str, default='True', choices=('True', 'False'))
 parser.add_argument('--test_synthetic', type=str, default='True', choices=('True', 'False'))

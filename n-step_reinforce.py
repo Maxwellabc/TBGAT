@@ -7,6 +7,7 @@ import torch.optim as optim
 from env.environment import Env
 from model.actor import Actor
 from env.generateJSP import uni_instance_gen as inst_gen
+from env.stochastic_jsp import StochasticRewardConfig
 from pathlib import Path
 from env.message_passing_evl import exact_solver
 from parameters import args
@@ -29,6 +30,26 @@ class NeuralTabu:
             args.problem_type, args.j, args.m, args.lr, args.steps_learn, args.transit, args.batch_size, args.total_instances,
             args.step_validation, args.ent_coeff, args.training_seed, args.embed_tabu_label, args.action_selection_type
         )
+        # Default flags leave this string unchanged, so test_jssp.py / test_fssp.py
+        # still find the deterministic checkpoints. A stochastic run gets its own suffix.
+        self.stochastic_reward = StochasticRewardConfig.from_flags(
+            n_scenarios=args.n_scenarios,
+            cv=args.cv,
+            distribution=args.distribution,
+            alpha=args.alpha,
+            reward_objective=args.reward_objective,
+            cvar_weight=args.cvar_weight,
+            seed=args.training_seed,
+        )
+        if self.stochastic_reward.enabled:
+            cfg = self.stochastic_reward
+            self.algo_config += '-stoch-n{n}-cv{cv:.6g}-{dist}-a{alpha:.6g}-w{w:.6g}'.format(
+                n=cfg.n_scenarios,
+                cv=cfg.cv,
+                dist=cfg.distribution,
+                alpha=cfg.alpha,
+                w=cfg.cvar_weight,
+            )
 
         # load or generate validation dataset
         validation_data_path = './validation_data/{}_validation_data_and_Cmax_{}x{}_[{},{}].npy'.format(
@@ -199,6 +220,25 @@ class NeuralTabu:
                                            args.embed_tabu_label)
               )
         print()
+        # The actor still reads nominal dur/est/lst. Only the reward tensor below
+        # uses scenario makespans, and only when n_scenarios > 0. Validation is
+        # left on the nominal CPM so its gap against deterministic Cmax is unchanged.
+        self.env_training.configure_stochastic_reward(self.stochastic_reward)
+        if self.stochastic_reward.enabled:
+            cfg = self.stochastic_reward
+            print(
+                "Stochastic reward on: n_scenarios={}, cv={}, distribution={}, alpha={}, "
+                "cvar_weight={} (objective (1-w)*mean makespan + w*CVaR). "
+                "N5 and actor features stay on the nominal CPM. "
+                "Validation gaps stay nominal. Scenario seed={}.".format(
+                    cfg.n_scenarios,
+                    cfg.cv,
+                    cfg.distribution,
+                    cfg.alpha,
+                    cfg.cvar_weight,
+                    cfg.seed,
+                )
+            )
 
         policy = Actor(
             in_channels_fwd=args.in_channels_fwd,
@@ -271,14 +311,19 @@ class NeuralTabu:
             # training log
             training_log.append(self.env_training.current_objs.mean().cpu().item())
 
-            pbar.set_postfix(
-                {'Batch Mean Performance': '{:.2f} ({:.2f}s)'.format(
+            postfix = {
+                'Batch Mean Performance': '{:.2f} ({:.2f}s)'.format(
                     self.env_training.current_objs.cpu().mean().item(),
                     t2 - t1
                 ),
-                    'V-IC': '{:.4f}'.format(self.gap_incumbent),
-                    'V-LS': '{:.4f}'.format(self.gap_last_step)}
-            )
+                'V-IC': '{:.4f}'.format(self.gap_incumbent),
+                'V-LS': '{:.4f}'.format(self.gap_last_step),
+            }
+            if self.env_training.stochastic_objs is not None:
+                postfix['StochObj'] = '{:.2f}'.format(
+                    self.env_training.stochastic_objs.detach().cpu().mean().item()
+                )
+            pbar.set_postfix(postfix)
 
             # start validation and saving model & logs...
             if batch_i % args.step_validation == 0:
