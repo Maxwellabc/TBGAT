@@ -14,6 +14,12 @@ from env.message_passing_evl import MassagePassingEval
 import networkx as nx
 import random
 from env.message_passing_evl import cpm_forward_and_backward
+from env.stochastic_jsp import (
+    StochasticRewardConfig,
+    evaluate_scenarios,
+    generate_stochastic_scenarios,
+    scenario_objective,
+)
 
 
 def index_to_mask(index, size=None):
@@ -61,6 +67,14 @@ class Env:
         # do not consider backward move if True, e.g., [5, 8] will be excluded if previous move is [8, 5], default True.
         self.mask_previous_action = mask_previous_action
         self.longest_path_finder = longest_path_finder
+        # n_scenarios=0 keeps the nominal makespan reward. Scoring never writes
+        # scenario durations back onto the disjunctive graph.
+        self.stochastic_reward = StochasticRewardConfig()
+        self._scenario_batch = None
+        self.stochastic_mean = None
+        self.stochastic_cvar = None
+        self.stochastic_objs = None
+        self.stochastic_incumbent = None
 
     def _init_solver(self, init, device, p_lists=None, prt=False):
         init, device = init, device
@@ -454,7 +468,10 @@ class Env:
             self.G_batch.x = x
             self.G_batch.__setattr__("est", est)
 
-            # reward
+            # Reward is the improvement over the incumbent nominal makespan.
+            # When scenario scoring is enabled, the returned reward is instead
+            # the improvement in (1-w)*mean + w*CVaR on the fixed scenario
+            # batch. est/lst, dur, and the N5 call below stay on this nominal pass.
             reward = torch.where(
                 self.incumbent_objs - make_span > 0,
                 self.incumbent_objs - make_span,
@@ -463,6 +480,10 @@ class Env:
             # update objs
             self.incumbent_objs = torch.minimum(self.incumbent_objs, make_span)
             self.current_objs = make_span
+            if self.stochastic_reward is not None and self.stochastic_reward.enabled:
+                objective = self.score_current_order()
+                reward = torch.clamp(self.stochastic_incumbent - objective, min=0)
+                self.stochastic_incumbent = torch.minimum(self.stochastic_incumbent, objective)
             # update tabu list and do_not_select
             action_instance_id = self.G_batch.batch[u].cpu().numpy()
             for a_reversed, instance_id in zip(action.flip([1]), action_instance_id):
@@ -568,6 +589,77 @@ class Env:
 
         return collect_path
 
+    def configure_stochastic_reward(self, config=None, **kwargs):
+        """Opt the reward into scenario scoring. Takes effect on the next ``reset``.
+
+        ``n_scenarios=0`` keeps the nominal makespan reward and does not sample
+        scenarios. N5 and the CPM features are unchanged either way. Pass a
+        :class:`StochasticRewardConfig` or the same keyword arguments.
+        ``alpha`` and ``cvar_weight`` are read when the order is scored;
+        the scenario batch itself is drawn in ``reset``.
+        """
+        if config is not None and kwargs:
+            raise TypeError("pass a StochasticRewardConfig or keyword arguments, not both")
+        if config is None:
+            config = StochasticRewardConfig(**kwargs)
+        elif not isinstance(config, StochasticRewardConfig):
+            raise TypeError("config must be a StochasticRewardConfig")
+        self.stochastic_reward = config
+        return config
+
+    def _as_objective_tensor(self, values):
+        return torch.as_tensor(
+            np.asarray(values, dtype=np.float64),
+            dtype=torch.float32,
+            device=self.G_batch.edge_index.device,
+        ).reshape(-1)
+
+    def score_current_order(self):
+        """Mean / CVaR objective of the current machine order on the reset-time scenarios.
+
+        Does not change ``dur``, ``est``, ``lst``, or the N5 neighbourhood.
+        Scenario durations are written only onto copies inside
+        ``evaluate_scenarios``.
+        """
+        cfg = self.stochastic_reward
+        if cfg is None or not cfg.enabled:
+            raise RuntimeError("stochastic reward is disabled")
+        if self._scenario_batch is None or self.G_batch is None:
+            raise RuntimeError("call reset() before scoring scenarios")
+        result = evaluate_scenarios(
+            self.G_batch,
+            self._scenario_batch,
+            alpha=cfg.alpha,
+            device=self.G_batch.edge_index.device,
+            evaluator=self.evaluator,
+        )
+        self.stochastic_mean = self._as_objective_tensor(result.mean)
+        self.stochastic_cvar = self._as_objective_tensor(result.cvar)
+        self.stochastic_objs = self._as_objective_tensor(scenario_objective(result, cfg.cvar_weight))
+        return self.stochastic_objs
+
+    def _bind_scenarios(self, instances):
+        cfg = self.stochastic_reward
+        self._scenario_batch = generate_stochastic_scenarios(
+            [np.asarray(inst) for inst in instances],
+            n_scenarios=cfg.n_scenarios,
+            cv=cfg.cv,
+            distribution=cfg.distribution,
+            seed=cfg.seed,
+        )
+
+    def _prepare_stochastic_reward(self, instances):
+        self._scenario_batch = None
+        self.stochastic_mean = None
+        self.stochastic_cvar = None
+        self.stochastic_objs = None
+        self.stochastic_incumbent = None
+        cfg = self.stochastic_reward
+        if cfg is None or not cfg.enabled:
+            return
+        self._bind_scenarios(instances)
+        self.stochastic_incumbent = self.score_current_order().clone()
+
     def reset(self,
               instances,
               init_sol_type,
@@ -616,6 +708,7 @@ class Env:
 
         self.current_objs, self.incumbent_objs = make_span, make_span
         self.G_batch = G_batch
+        self._prepare_stochastic_reward(instances)
 
         return self.G_batch, self.get_candidate_moves()
 

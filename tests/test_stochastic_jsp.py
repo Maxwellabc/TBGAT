@@ -186,15 +186,72 @@ class GeneratorTests(unittest.TestCase):
         np.testing.assert_array_equal(kept, np.broadcast_to(zero[0], (3,) + zero[0].shape))
 
 
+def _rockafellar_uryasev(samples, alpha):
+    """Minimum of the empirical Rockafellar-Uryasev function over the sample points."""
+    x = np.asarray(samples, dtype=np.float64).reshape(-1)
+    scale = 1.0 / (x.size * (1.0 - float(alpha)))
+    best = None
+    for zeta in x:
+        value = float(zeta + scale * np.maximum(x - zeta, 0.0).sum())
+        if best is None or value < best:
+            best = value
+    return best
+
+
 class CvarTests(unittest.TestCase):
-    def test_tail_average_definition(self):
+    def test_alpha_0_9_n_10_is_the_worst_10_percent(self):
         samples = np.arange(1, 11, dtype=np.float64)  # 1..10
-        self.assertAlmostEqual(float(empirical_cvar(samples, 0.9)), 9.5)
-        self.assertAlmostEqual(float(empirical_cvar(samples, 0.0)), float(samples.mean()))
-        self.assertAlmostEqual(float(empirical_cvar(samples, 1.0)), 10.0)
-        batch = np.stack([samples, samples[::-1]], axis=0)
-        both = empirical_cvar(batch, 0.9)
-        np.testing.assert_allclose(both, [9.5, 9.5])
+        # (1-0.9)*10 is 0.9999999999999998 in float64. The snap still leaves
+        # a tail of one scenario: the worst makespan, not the mean of two.
+        self.assertLess((1.0 - 0.9) * 10.0, 1.0)
+        cvar = float(empirical_cvar(samples, 0.9))
+        self.assertEqual(cvar, 10.0)
+        self.assertNotAlmostEqual(cvar, 9.5)
+        shuffled = np.array([4, 10, 1, 7, 3, 9, 2, 8, 6, 5], dtype=np.float64)
+        self.assertEqual(float(empirical_cvar(shuffled, 0.9)), 10.0)
+        batch = np.stack([samples, samples[::-1], shuffled], axis=0)
+        np.testing.assert_allclose(empirical_cvar(batch, 0.9), [10.0, 10.0, 10.0])
+
+    def test_integer_tail_is_the_mean_of_that_many_worst_scenarios(self):
+        samples = np.arange(1, 11, dtype=np.float64)
+        # alpha=0.8 -> w=2. The float product is 1.9999999999999996 and must snap.
+        self.assertEqual(float(empirical_cvar(samples, 0.8)), 9.5)
+        # alpha=0.5 -> w=5, mean of 6..10.
+        self.assertEqual(float(empirical_cvar(samples, 0.5)), 8.0)
+        self.assertEqual(float(empirical_cvar(samples, 0.0)), float(samples.mean()))
+
+    def test_weighted_remainder_keeps_tail_mass(self):
+        samples = np.arange(1, 11, dtype=np.float64)
+        # alpha=0.75 -> w=2.5. (10 + 9 + 0.5*8) / 2.5 = 9.2
+        cvar = float(empirical_cvar(samples, 0.75))
+        self.assertAlmostEqual(cvar, 9.2)
+        self.assertNotAlmostEqual(cvar, 9.5)
+        self.assertNotAlmostEqual(cvar, 9.0)
+        # Thinner than one scenario: still the worst, and the mass is 1-alpha.
+        self.assertEqual(float(empirical_cvar(samples, 0.95)), 10.0)
+
+    def test_alpha_0_is_the_mean_and_alpha_1_is_the_worst(self):
+        rng = np.random.default_rng(0)
+        samples = rng.normal(loc=20.0, scale=5.0, size=(6, 13))
+        np.testing.assert_allclose(empirical_cvar(samples, 0.0), samples.mean(axis=-1))
+        np.testing.assert_allclose(empirical_cvar(samples, 1.0), samples.max(axis=-1))
+        self.assertEqual(float(empirical_cvar(np.array(4.0), 0.3)), 4.0)
+
+    def test_mean_is_at_most_cvar_on_the_same_samples(self):
+        rng = np.random.default_rng(1)
+        samples = rng.normal(loc=20.0, scale=5.0, size=(6, 13))
+        for alpha in (0.0, 0.1, 0.5, 0.9, 0.95, 1.0):
+            cvar = empirical_cvar(samples, alpha)
+            self.assertTrue(np.all(samples.mean(axis=-1) <= np.asarray(cvar) + 1e-8))
+
+    def test_matches_rockafellar_uryasev_minimization(self):
+        samples = np.array([1, 4, 2, 9, 8, 3, 7, 5, 6, 10], dtype=np.float64)
+        for alpha in (0.0, 0.5, 0.75, 0.9, 0.95):
+            self.assertAlmostEqual(
+                float(empirical_cvar(samples, alpha)),
+                _rockafellar_uryasev(samples, alpha),
+                places=7,
+            )
 
 
 class EvaluatorTests(unittest.TestCase):
@@ -267,9 +324,10 @@ class EvaluatorTests(unittest.TestCase):
         self.assertEqual(scored.makespans.shape, (10,))
         self.assertGreater(float(scored.cvar), float(scored.mean))
         self.assertLessEqual(float(scored.mean), float(scored.cvar))
-        # Definition on this sample: mean of the two worst makespans.
+        # alpha=0.9 and 10 scenarios: the worst 10 percent, one scenario.
         ordered = np.sort(scored.makespans)
-        self.assertAlmostEqual(float(scored.cvar), float(ordered[-2:].mean()))
+        self.assertAlmostEqual(float(scored.cvar), float(ordered[-1]))
+        self.assertNotAlmostEqual(float(scored.cvar), float(ordered[-2:].mean()))
 
         noisy = generate_stochastic_scenarios(
             inst, n_scenarios=12, cv=0.3, distribution="lognormal", seed=19
